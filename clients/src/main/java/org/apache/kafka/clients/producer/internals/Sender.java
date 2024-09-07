@@ -74,21 +74,26 @@ public class Sender implements Runnable {
     private final Logger log;
 
     /* the state of each nodes connection */
+    // 处理网络请求
     private final KafkaClient client;
 
     /* the record accumulator that batches records */
+    // 消息收集器
     private final RecordAccumulator accumulator;
 
     /* the metadata for the client */
     private final ProducerMetadata metadata;
 
     /* the flag indicating whether the producer should guarantee the message order on the broker or not. */
+    // 消息是否排序
     private final boolean guaranteeMessageOrder;
 
     /* the maximum request size to attempt to send to the server */
+    // 最大请求
     private final int maxRequestSize;
 
     /* the number of acknowledgements to request from the server */
+    // kafka ack值，默认 -1 (all)
     private final short acks;
 
     /* the number of times to retry a failed request before giving up */
@@ -119,6 +124,7 @@ public class Sender implements Runnable {
     private final TransactionManager transactionManager;
 
     // A per-partition queue of batches ordered by creation time for tracking the in-flight batches
+    // 在途批次 预发送
     private final Map<TopicPartition, List<ProducerBatch>> inFlightBatches;
 
     public Sender(LogContext logContext,
@@ -210,6 +216,7 @@ public class Sender implements Runnable {
     }
 
     private void addToInflightBatches(List<ProducerBatch> batches) {
+        // 要发送到一个node的所有batches
         for (ProducerBatch batch : batches) {
             List<ProducerBatch> inflightBatchList = inFlightBatches.get(batch.topicPartition);
             if (inflightBatchList == null) {
@@ -219,7 +226,7 @@ public class Sender implements Runnable {
             inflightBatchList.add(batch);
         }
     }
-
+    //把按分区收集的请求集合转换为按节点收集的请求集合，Map<Integer, List<ProducerBatch>>，key是nodeId，value是List<ProducerBatch>
     public void addToInflightBatches(Map<Integer, List<ProducerBatch>> batches) {
         for (List<ProducerBatch> batchList : batches.values()) {
             addToInflightBatches(batchList);
@@ -394,7 +401,10 @@ public class Sender implements Runnable {
         }
 
         // create produce requests
+        // 把按分区收集的请求集合转换为按节点收集的请求集合，Map<Integer, List<ProducerBatch>>，key是nodeId，value是List<ProducerBatch>
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(metadata, result.readyNodes, this.maxRequestSize, now);
+
+        //把按分区收集的请求集合，Map<Integer, List<ProducerBatch>>，key是TopicPartition ，value是List<ProducerBatch>
         addToInflightBatches(batches);
         if (guaranteeMessageOrder) {
             // Mute all the partitions drained
@@ -574,6 +584,18 @@ public class Sender implements Runnable {
     /**
      * Handle a produce response
      */
+    /*
+    * 这里 batches 是一个节点下,所有要发送的分区batch
+    *
+    *
+    * 分区 : 1  2  3  4  5  6
+    * 节点:  A     B     C
+    *  1和2 是一组发送到 节点A
+    *  3和4 是一组发送到 节点B
+    *  5和6 是一组发送到 节点C
+    *
+    *  这里 batches 就是分区 1 和 2
+    * */
     private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, long now) {
         RequestHeader requestHeader = response.requestHeader();
         int correlationId = requestHeader.correlationId();
@@ -824,6 +846,9 @@ public class Sender implements Runnable {
     /**
      * Transfer the record batches into a list of produce requests on a per-node basis
      */
+    /*
+    * 把按分区收集的请求集合转换为按节点收集的请求集合，Map<Integer, List<ProducerBatch>>，key是nodeId，value是List<ProducerBatch>
+    * */
     private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
         for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
             sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, entry.getValue());
@@ -832,6 +857,9 @@ public class Sender implements Runnable {
     /**
      * Create a produce request from the given record batches
      */
+    /*
+    * 要发送的是一个node所有的batches
+    * */
     private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
         if (batches.isEmpty())
             return;
@@ -845,6 +873,14 @@ public class Sender implements Runnable {
                 minUsedMagic = batch.magic();
         }
         ProduceRequestData.TopicProduceDataCollection tpd = new ProduceRequestData.TopicProduceDataCollection();
+        //2.按分区填充produceRecordsByPartition集合。
+
+        /*
+        *  topicPartition1 : batch1  , batch2
+        *  topicPartition2 : batch3  , batch4
+        *
+        *  batches : {batch1, batch2, batch3, batch4}
+        * */
         for (ProducerBatch batch : batches) {
             TopicPartition tp = batch.topicPartition;
             MemoryRecords records = batch.records();
@@ -873,18 +909,21 @@ public class Sender implements Runnable {
         if (transactionManager != null && transactionManager.isTransactional()) {
             transactionalId = transactionManager.transactionalId();
         }
-
+        //3.创建requestBuilder对象。
         ProduceRequest.Builder requestBuilder = ProduceRequest.forMagic(minUsedMagic,
                 new ProduceRequestData()
                         .setAcks(acks)
                         .setTimeoutMs(timeout)
                         .setTransactionalId(transactionalId)
                         .setTopicData(tpd));
+        //4.创建回调
         RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, time.milliseconds());
 
         String nodeId = Integer.toString(destination);
+        //5.创建clientRequest
         ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
                 requestTimeoutMs, callback);
+        //6.把clientRequest发送给NetworkClient，完成消息的预发送
         client.send(clientRequest, now);
         log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
     }
